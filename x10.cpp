@@ -43,6 +43,7 @@ volatile unsigned long mask;           // MSB first - bit 12 - bit 0
 volatile unsigned int X10BitCnt; // counts bit sequence in frame
 volatile unsigned int ZCrossCnt;   // counts Z crossings in frame
 volatile unsigned long rcveBuff;       // holds the 13 bits received in a frame
+volatile unsigned long rcveBuffOrig;
 volatile boolean X10rcvd;      // true if a new frame has been received
 boolean _newX10;         // both the unit frame and the command frame received
 byte _houseCode,_unitCode,_cmndCode;   // 
@@ -67,6 +68,7 @@ void x10_Parse_Frame_wrapper() {
 // Initialise instance of X10 object
 void x10::init(int zeroCrossingPin, int dataPin, int rp, int led)
 {  
+	object = this;
 	this->zeroCrossingPin = zeroCrossingPin;      // the zero crossing pin
 	this->dataPin = dataPin;        		// the output data pin
 	this->recvPin = rp;
@@ -321,33 +323,43 @@ byte x10::cmndCode(void)
 }
 
 void x10::Check_Rcvr(){    // ISR - called when zero crossing (on CHANGE)
-  if (X10BitCnt == 0) {                // looking for new frame
-    delayMicroseconds(this->offsetDelay);   // wait for bit
-    if(digitalRead(this->recvPin)) return;  // still high - no start bit - get out
-    if (this->ledPin>0) { digitalWrite(this->ledPin, HIGH); }     // indicate you got something
-    rcveBuff = 0;
-    mask = 0x1000;                     // bitmask with bit 12 set
-    rcveBuff = rcveBuff | mask;        // sets bit 12 (highest)
-    mask = mask >> 1;                  // move bit down in bit mask
-    X10BitCnt = 1;                     // inc the bit count
-    ZCrossCnt = 1;                     // need to count zero crossings too
-    return;
-  }
-  // Begins here if NOT the first bit . . .
-  ZCrossCnt++;                         // inc the zero crossing count
-  // after SC (first 4 bits) ignore the pariety bits - so only read odd crossings
-  if (X10BitCnt < 5 || (ZCrossCnt & 0x01)){ // if it's an odd # zero crossing
-    delayMicroseconds(this->offsetDelay);   // wait for bit
-    if(!digitalRead(this->recvPin)) rcveBuff = rcveBuff | mask;  // got a 1 set the bit, else skip and leave it 0
-    mask = mask >> 1;                  // move bit down in bit mask
-    X10BitCnt++;
+  // Read the next bit
+  delayMicroseconds(this->offsetDelay);   // wait for bit
+  rcveBuff <<= 1;
+  rcveBuff |= digitalRead(this->recvPin);
 
-    if(X10BitCnt == 13){               // done with frame after 13 bits
-      for (byte i=0;i<5;i++)delayMicroseconds(this->halfCycleDelay); // need this
-      X10rcvd = true;                  // a new frame has been received
-      if (this->ledPin>0) { digitalWrite(this->ledPin, LOW); }     // indicate you got something
-      X10BitCnt = 0;
-      x10_Parse_Frame_wrapper();                   // parse out the house & unit code and command
+  if (X10BitCnt == 0) {
+    // Looking for a start code (1110)
+    rcveBuff &= 0xf;
+    if (rcveBuff == B1110) {
+      // Found! Set X10BitCnt=4 to trigger next interrupt to start read the data
+      X10BitCnt = 4;
+      ZCrossCnt = 0;
+    }
+  } else {
+    ZCrossCnt++;
+    if ((ZCrossCnt & 1) == 0) {
+      // Two new bits in the buffer. The first is the data bit and the second should be the complement of the first.
+      byte pair = rcveBuff & 3;
+      if (pair != 0B10 && pair != B01) {
+        // Bad parity. Start over.
+        X10BitCnt = 0;
+        ZCrossCnt = 0;
+      } else {
+        X10BitCnt++;
+        rcveBuff >>= 1; // Remove the parity bit
+        if (X10BitCnt == 13) {
+          // Full frame with OK parity received
+
+          delayMicroseconds(this->halfCycleDelay * 5); // need this
+
+          // Reset state
+          X10BitCnt = 0;
+          ZCrossCnt = 0;
+          rcveBuffOrig = rcveBuff;
+          this->Parse_Frame();
+        }
+      }
     }
   }
 }
@@ -457,14 +469,17 @@ void x10::detach(void)
 }
 
 void x10::debug(void){
-  Serial.print("SC-");
+  Serial.print('(');
+  Serial.print(rcveBuffOrig,BIN);
+  Serial.print(')');
+  Serial.print(" SC-");
   Serial.print(startCode,BIN);
   Serial.print(" HOUSE-");
-  Serial.print(_houseCode);
+  Serial.print((char) _houseCode);
   Serial.print(" UNIT-");
   Serial.print(_unitCode,DEC);
-  Serial.print(" CMND");
-  Serial.print(_cmndCode,DEC);
+  Serial.print(" CMND-");
+  Serial.print(_cmndCode,BIN);
   if(_cmndCode == ON)Serial.print(" (ON)");
   if(_cmndCode == OFF)Serial.print(" (OFF)");
   Serial.println("");
